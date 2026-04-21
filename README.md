@@ -455,7 +455,7 @@ Los componentes principales del repositorio son:
 * La evaluación de Constitución de Títulos Únicos se construye sobre la tabla transformada `Inversiones`, no sobre el archivo bruto original.
 * La rutina `LimpiarDatos` elimina de forma intencional hojas, consultas y conexiones para restaurar un estado base del entorno.
 * La dependencia externa del scraper debe mantenerse alineada con el formato de salida esperado por el proceso.
-* Esta documentación describe la lógica versionada en los módulos publicados en el repositorio y la ampliación funcional prevista con `modLimpiarDatos.bas`.
+* Esta documentación describe la lógica versionada en los módulos publicados en el repositorio.
 
 ## Mejoras futuras sugeridas
 
@@ -465,7 +465,3 @@ Los componentes principales del repositorio son:
 ## Estado del proyecto
 
 Repositorio orientado a la automatización operativa de revisión de inversiones y validación de tasas de referencia SBS, con dependencia externa documentada para la obtención de la base de tasas pasivas y con una rutina explícita de limpieza para reinicio controlado del entorno.
-
-```
-
-La parte verificable en el repo público confirma la estructura `Excel/Módulos`, la presencia de `modActualizar.bas`, `modInversiones.bas` y `modTasas.bas`, la macro `ImportarInversionesDesdeXls`, la creación de `Inversiones_Raw`, la vista `Acciones ETF`, la exigencia de la tabla `TasaPasivaTipoPersona`, la salida de `Constitución Títulos Únicos`, los tramos de duración y los estados como `Dentro del rango`, `Fuera del rango`, `El banco no es peruano` y `No encontrado`. También se ve que el scraper externo usa `tkinter`, `selenium`, `BeautifulSoup` y `openpyxl`, y que el empaquetado contempla `PyInstaller`. :contentReference[oaicite:1]{index=1}
