@@ -1,5 +1,11 @@
 Option Explicit
 
+#If VBA7 Then
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#Else
+    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#End If
+
 ' =========================================================
 '  Macro principal: versión productiva basada en Debug_V3
 '  Tablas principales:
@@ -31,6 +37,7 @@ Public Sub ImportarInversionesDesdeXls()
     Dim r As Long
     Dim lastRowCopia As Long
     Dim lastColCopia As Long
+    Dim shapesConError As String
 
     ruta = Application.GetOpenFilename( _
                 "Archivos Excel (*.xls;*.xlsx;*.xlsm;*.xlsb),*.xls;*.xlsx;*.xlsm;*.xlsb", _
@@ -123,19 +130,37 @@ Public Sub ImportarInversionesDesdeXls()
     Next r
 
     ' Copiar shapes (logos, etc.) con mismo tamaño y posición
+    ' NOTA: se usa CopiarShapeConReintento para evitar el error 800401d0
+    ' (CLIPBRD_E_CANT_OPEN) que ocurre quando el portapapeles de Windows
+    ' está temporalmente bloqueado (frecuente en entornos con EDR/CrowdStrike).
+    shapesConError = ""
+
     For Each shp In wsSrc.Shapes
-        shp.Copy
-        wsOrigen.Paste
-        Set shpNew = wsOrigen.Shapes(wsOrigen.Shapes.Count)
-        With shpNew
-            .LockAspectRatio = msoTrue
-            .Width = shp.Width
-            .Height = shp.Height
-            .Top = shp.Top
-            .Left = shp.Left
-            .Placement = shp.Placement
-        End With
+        If CopiarShapeConReintento(shp) Then
+            If PegarShapeEnHoja(wsOrigen) Then
+                Set shpNew = wsOrigen.Shapes(wsOrigen.Shapes.Count)
+                With shpNew
+                    .LockAspectRatio = msoTrue
+                    .Width = shp.Width
+                    .Height = shp.Height
+                    .Top = shp.Top
+                    .Left = shp.Left
+                    .Placement = shp.Placement
+                End With
+            Else
+                shapesConError = shapesConError & "  - " & shp.Name & " (error al pegar)" & vbCrLf
+            End If
+        Else
+            shapesConError = shapesConError & "  - " & shp.Name & vbCrLf
+        End If
     Next shp
+
+    If Len(shapesConError) > 0 Then
+        MsgBox "No se pudieron copiar los siguientes shapes tras varios intentos " & _
+               "(posible bloqueo temporal del portapapeles):" & vbCrLf & vbCrLf & _
+               shapesConError & vbCrLf & _
+               "El proceso continuará sin ellos.", vbExclamation
+    End If
 
     ' 3) Crear tabla Inversiones_Raw en Origen_Inversiones usando solo el bloque de datos
     On Error Resume Next
@@ -235,6 +260,94 @@ End Sub
 ' =========================================================
 '  Helpers generales
 ' =========================================================
+
+' Copia un shape al portapapeles con reintentos, para evitar el error
+' -2147221040 (800401d0 / CLIPBRD_E_CANT_OPEN) que ocurre de forma
+' intermitente (o consistente, si el portapapeles queda bloqueado por
+' otro proceso, típicamente el EDR/CrowdStrike) al usar Shape.Copy.
+' Fuerza ScreenUpdating = True durante el intento, ya que Copy falla
+' con más frecuencia cuando ScreenUpdating está en False.
+Private Function CopiarShapeConReintento(ByVal shp As Shape, _
+                                          Optional ByVal intentos As Long = 8, _
+                                          Optional ByVal esperaMs As Long = 200) As Boolean
+
+    Dim i As Long
+    Dim screenUpdatingPrevio As Boolean
+    Dim errNum As Long
+
+    screenUpdatingPrevio = Application.ScreenUpdating
+    Application.ScreenUpdating = True
+
+    For i = 1 To intentos
+        On Error Resume Next
+        Err.Clear
+        shp.Copy
+        errNum = Err.Number
+        On Error GoTo 0
+
+        If errNum = 0 Then
+            CopiarShapeConReintento = True
+            Application.ScreenUpdating = screenUpdatingPrevio
+            Exit Function
+        End If
+
+        ' Da tiempo a Windows / al EDR para liberar el portapapeles antes de reintentar
+        DoEvents
+        Sleep esperaMs
+    Next i
+
+    Application.ScreenUpdating = screenUpdatingPrevio
+    CopiarShapeConReintento = False
+
+End Function
+
+' Pega el contenido del portapapeles (un shape) en la hoja indicada, con
+' reintentos. Igual que Copy, Paste de un shape puede fallar con error 1004
+' si ScreenUpdating está en False (Activate no toma efecto real) o si el
+' portapapeles queda momentáneamente bloqueado (EDR/CrowdStrike).
+Private Function PegarShapeEnHoja(ByVal wsDestino As Worksheet, _
+                                   Optional ByVal intentos As Long = 8, _
+                                   Optional ByVal esperaMs As Long = 200) As Boolean
+
+    Dim i As Long
+    Dim screenUpdatingPrevio As Boolean
+    Dim errNum As Long
+
+    screenUpdatingPrevio = Application.ScreenUpdating
+    Application.ScreenUpdating = True
+
+    On Error Resume Next
+    wsDestino.Parent.Activate
+    wsDestino.Activate
+    On Error GoTo 0
+    DoEvents
+
+    For i = 1 To intentos
+        On Error Resume Next
+        Err.Clear
+        wsDestino.Paste
+        errNum = Err.Number
+        On Error GoTo 0
+
+        If errNum = 0 Then
+            PegarShapeEnHoja = True
+            Application.ScreenUpdating = screenUpdatingPrevio
+            Exit Function
+        End If
+
+        ' Reintentar activación por si la ventana no tomó foco a la primera
+        On Error Resume Next
+        wsDestino.Parent.Activate
+        wsDestino.Activate
+        On Error GoTo 0
+        DoEvents
+        Sleep esperaMs
+    Next i
+
+    Application.ScreenUpdating = screenUpdatingPrevio
+    PegarShapeEnHoja = False
+
+End Function
 
 Private Function NormalizarTildes(ByVal s As String) As String
     Dim i As Long
@@ -817,9 +930,16 @@ Private Sub CopiarImagenA1(ByVal wsOrigen As Worksheet, ByVal wsDestino As Works
         End If
     Next i
 
-    ' Copiar el logo desde el origen
-    shpLogo.Copy
-    wsDestino.Paste
+    ' Copiar el logo desde el origen (con reintentos ante 800401d0)
+    If Not CopiarShapeConReintento(shpLogo) Then
+        Exit Sub
+    End If
+
+    ' Pegar con reintentos (evita error 1004 en Paste)
+    If Not PegarShapeEnHoja(wsDestino) Then
+        Exit Sub
+    End If
+
     Set shpNew = wsDestino.Shapes(wsDestino.Shapes.Count)
 
     With shpNew
