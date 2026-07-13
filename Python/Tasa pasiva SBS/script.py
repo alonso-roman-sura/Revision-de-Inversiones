@@ -3,12 +3,20 @@ Interfaz Tkinter para descargar las tasas pasivas de depósitos a plazo fijo
 desde la SBS para un rango de fechas y exportarlas a Excel.
 """
 
+from __future__ import annotations
+
+import csv
+import calendar
+import ctypes
 import os
 import re
+import sys
 import time
 import threading
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+from pathlib import Path
+from typing import Callable, Literal
 
 import numpy as np
 import pandas as pd
@@ -25,7 +33,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, scrolledtext
+from tkinter import filedialog, messagebox
+import tkinter.font as tkfont
 
 # Workaround Python 3.13: el GC destruye tk.Variable desde hilos secundarios
 _orig_var_del = tk.Variable.__del__
@@ -36,6 +45,402 @@ def _safe_var_del(self):
         pass
 tk.Variable.__del__ = _safe_var_del
 
+# ==================== KIT DE INTERFAZ SURA INVESTMENTS ====================
+# Adaptado de la plantilla de interfaz gráfica compartida del equipo
+# (componentes reutilizables: SuraEntry, SuraButton, SuraInputRow, SuraLogBox,
+# SuraProgressBar, FontSet). Se mantiene aquí en el mismo archivo, siguiendo
+# la convención de herramientas Python de una sola pieza usada en este
+# proyecto (sin equipo de programación dedicado, para minimizar partes
+# móviles al mantener con IA).
+
+ButtonVariant = Literal["primary", "secondary"]
+CommandFunction = Callable[[], None]
+
+
+def resource_path(relative_path: str) -> str:
+    candidates: list[str] = []
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(meipass)
+
+    here = os.path.abspath(os.path.dirname(__file__))
+    candidates.append(here)                   # junto al script
+    candidates.append(os.path.dirname(here))  # raiz del kit (assets/ y fonts/ compartidos)
+
+    for base in candidates:
+        full = os.path.join(base, relative_path)
+        if os.path.exists(full):
+            return full
+
+    return os.path.join(here, relative_path)
+
+
+def default_output_dir() -> Path:
+    # Cuando se corre como .exe empaquetado (--onefile), os.getcwd() puede
+    # apuntar a una carpeta inesperada según cómo se lance el ejecutable.
+    # Se usa la carpeta del propio .exe (o del script) como valor por
+    # defecto más predecible.
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def load_bundled_fonts() -> None:
+    # Si "Sura Sans" no esta instalada en el equipo, carga las OTF de la carpeta
+    # fonts/ como fuente privada del proceso (Windows), sin instalar nada.
+    if sys.platform != "win32":
+        return
+
+    fonts_dir = resource_path("assets/fonts")
+    if not os.path.isdir(fonts_dir):
+        return
+
+    try:
+        FR_PRIVATE = 0x10
+        gdi32 = ctypes.windll.gdi32
+        gdi32.AddFontResourceExW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+        gdi32.AddFontResourceExW.restype = ctypes.c_int
+
+        for name in os.listdir(fonts_dir):
+            if name.lower().endswith((".otf", ".ttf")):
+                try:
+                    gdi32.AddFontResourceExW(os.path.join(fonts_dir, name), FR_PRIVATE, None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def enable_windows_dpi_awareness() -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def is_windows_dark_mode() -> bool:
+    if sys.platform != "win32":
+        return False
+
+    try:
+        import winreg
+
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return value == 0
+
+    except Exception:
+        return False
+
+
+# --- Identidad de esta herramienta ---
+APP_NAME = "Descargador de Tasas Pasivas SBS"
+APP_SUBTITLE = "FONDOS SURA SAF — depósitos a plazo fijo, portal SBS."
+
+APP_WIDTH = 1040
+APP_HEIGHT = 800
+
+HEADER_HEIGHT = 150
+ACCENT_HEIGHT = 2
+MARGIN_X = 38
+
+TITLE_Y = HEADER_HEIGHT + ACCENT_HEIGHT + 28
+SEPARATOR_Y = TITLE_Y + 46
+SUBTITLE_Y = SEPARATOR_Y + 16
+
+FORM_Y = 292
+
+PROGRESS_Y = 724
+BUTTONS_Y = 744
+LOG_BOTTOM_Y = PROGRESS_Y - 14  # el log siempre termina justo antes de la barra de progreso
+
+COLOR_BLACK = "#161618"
+COLOR_TEXT = "#24272A"
+COLOR_TEXT_MUTED = "#59646E"
+COLOR_BORDER = "#D9D9D9"
+COLOR_BORDER_DARK = "#98A3AE"
+COLOR_ROW_ALT = "#F6F6F6"
+COLOR_WHITE = "#FFFFFF"
+COLOR_BLUE = "#0A2CCE"
+COLOR_DISABLED_BG = "#F4F4F4"
+COLOR_DISABLED_TEXT = "#9A9A9A"
+
+FONT_FALLBACK = "Arial"
+
+
+def detect_sura_font(root: tk.Tk) -> str:
+    try:
+        families = list(tkfont.families(root))
+        families_sorted = sorted(families, key=lambda name: name.lower())
+
+        for family in families_sorted:
+            normalized = family.lower().replace(" ", "")
+            if "sura" in normalized:
+                return family
+
+    except Exception:
+        pass
+
+    return FONT_FALLBACK
+
+
+class FontSet:
+    def __init__(self, root: tk.Tk) -> None:
+        self.brand: str = detect_sura_font(root)
+        self.body: str = self.brand   # Sura Sans si esta disponible; Arial como fallback
+
+        self.title: tkfont.Font = tkfont.Font(family=self.brand, size=21, weight="bold")
+        self.subtitle: tkfont.Font = tkfont.Font(family=self.body, size=10)
+        self.section: tkfont.Font = tkfont.Font(family=self.brand, size=12, weight="bold")
+        self.label: tkfont.Font = tkfont.Font(family=self.body, size=10, weight="bold")
+        self.input: tkfont.Font = tkfont.Font(family=self.body, size=10)
+        self.button: tkfont.Font = tkfont.Font(family=self.brand, size=10, weight="bold")
+        self.status: tkfont.Font = tkfont.Font(family=self.body, size=9)
+        self.log: tkfont.Font = tkfont.Font(family=self.body, size=9)
+        self.checkbox: tkfont.Font = tkfont.Font(family=self.body, size=9)
+
+
+class SuraEntry(tk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        width: int,
+        height: int,
+        font: tkfont.Font,
+        readonly: bool = False,
+    ) -> None:
+        super().__init__(master, width=width, height=height, bg=COLOR_BORDER_DARK,
+                          highlightthickness=0, bd=0)
+
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+        self.var: tk.StringVar = tk.StringVar()
+
+        self.inner: tk.Frame = tk.Frame(self, bg=COLOR_WHITE, bd=0, highlightthickness=0)
+        self.inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self.entry: tk.Entry = tk.Entry(
+            self.inner, textvariable=self.var, bd=0, highlightthickness=0,
+            relief="flat", bg=COLOR_WHITE, fg=COLOR_TEXT, insertbackground=COLOR_TEXT,
+            font=font, justify="center",
+        )
+        self.entry.pack(fill="both", expand=True, padx=(10, 8), pady=(5, 4))
+
+        self.entry.bind("<FocusIn>", self._on_focus_in)
+        self.entry.bind("<FocusOut>", self._on_focus_out)
+
+        if readonly:
+            self.entry.configure(state="readonly", readonlybackground=COLOR_WHITE)
+
+    def _on_focus_in(self, _event: tk.Event | None = None) -> None:
+        self.configure(bg=COLOR_BLUE)
+
+    def _on_focus_out(self, _event: tk.Event | None = None) -> None:
+        self.configure(bg=COLOR_BORDER_DARK)
+
+    def get(self) -> str:
+        return self.var.get()
+
+    def set(self, value: str) -> None:
+        current_state = str(self.entry.cget("state"))
+        if current_state == "readonly":
+            self.entry.configure(state="normal")
+            self.var.set(value)
+            self.entry.configure(state="readonly")
+        else:
+            self.var.set(value)
+
+    def clear(self) -> None:
+        self.set("")
+
+    def configure_validation(self, vcmd) -> None:
+        self.entry.configure(validate="key", validatecommand=vcmd)
+
+
+class SuraButton(tk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        text: str,
+        command: CommandFunction | None = None,
+        variant: ButtonVariant = "secondary",
+        width: int = 130,
+        height: int = 36,
+        font: tkfont.Font | None = None,
+    ) -> None:
+        self.variant: ButtonVariant = variant
+        self.command: CommandFunction | None = command
+        self.enabled: bool = True
+        self.colors: dict[str, str] = self._resolve_colors(variant)
+
+        super().__init__(master, width=width, height=height, bg=self.colors["border"],
+                          bd=0, highlightthickness=0)
+
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+        self._text = text
+        self.label: tk.Label = tk.Label(
+            self, text=text, bg=self.colors["bg"], fg=self.colors["fg"],
+            font=font, bd=0, cursor="hand2", anchor="center",
+        )
+        self.label.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self.label.bind("<Button-1>", self._on_click)
+        self.label.bind("<Enter>", self._on_enter)
+        self.label.bind("<Leave>", self._on_leave)
+
+    @staticmethod
+    def _resolve_colors(variant: ButtonVariant) -> dict[str, str]:
+        if variant == "primary":
+            return {
+                "bg": COLOR_BLACK, "fg": COLOR_WHITE, "border": COLOR_BLACK,
+                "hover": "#2A2A2D",
+                "disabled_bg": COLOR_DISABLED_BG, "disabled_fg": COLOR_DISABLED_TEXT,
+            }
+        return {
+            "bg": COLOR_WHITE, "fg": COLOR_TEXT, "border": COLOR_BLACK,
+            "hover": "#F3F3F3",
+            "disabled_bg": COLOR_DISABLED_BG, "disabled_fg": COLOR_DISABLED_TEXT,
+        }
+
+    def _on_click(self, _event: tk.Event | None = None) -> None:
+        if not self.enabled:
+            return
+        if self.command is not None:
+            self.command()
+
+    def _on_enter(self, _event: tk.Event | None = None) -> None:
+        if not self.enabled:
+            return
+        self.label.configure(bg=self.colors["hover"])
+
+    def _on_leave(self, _event: tk.Event | None = None) -> None:
+        if not self.enabled:
+            return
+        self.label.configure(bg=self.colors["bg"])
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self.label.configure(text=text)
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled
+        if enabled:
+            self.configure(bg=self.colors["border"])
+            self.label.configure(bg=self.colors["bg"], fg=self.colors["fg"], cursor="hand2")
+        else:
+            self.configure(bg=COLOR_BORDER)
+            self.label.configure(bg=self.colors["disabled_bg"], fg=self.colors["disabled_fg"],
+                                  cursor="arrow")
+
+
+class SuraInputRow(tk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        label_text: str,
+        fonts: FontSet,
+        row_width: int,
+        command: CommandFunction | None = None,
+        button_text: str = "Seleccionar",
+        row_bg: str = COLOR_WHITE,
+    ) -> None:
+        super().__init__(master, bg=row_bg, bd=0, highlightthickness=0)
+
+        label_x: int = 24
+        label_w: int = 210
+        entry_x: int = 250
+        button_w: int = 136
+        right_pad: int = 24
+        gap: int = 16
+
+        control_h: int = 36
+        control_y: int = (52 - control_h) // 2
+
+        button_x: int = row_width - right_pad - button_w
+        entry_w: int = button_x - gap - entry_x
+
+        self.label: tk.Label = tk.Label(
+            self, text=label_text, bg=row_bg, fg=COLOR_TEXT, font=fonts.label, anchor="w",
+        )
+        self.label.place(x=label_x, y=0, width=label_w, height=52)
+
+        self.entry: SuraEntry = SuraEntry(self, width=entry_w, height=control_h, font=fonts.input)
+        self.entry.place(x=entry_x, y=control_y)
+
+        self.button: SuraButton = SuraButton(
+            self, text=button_text, command=command, variant="secondary",
+            width=button_w, height=control_h, font=fonts.button,
+        )
+        self.button.place(x=button_x, y=control_y)
+
+
+class SuraLogBox(tk.Frame):
+    def __init__(self, master: tk.Misc, fonts: FontSet, width: int, height: int) -> None:
+        super().__init__(master, width=width, height=height, bg=COLOR_BORDER_DARK,
+                          bd=0, highlightthickness=0)
+
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+        self.inner: tk.Frame = tk.Frame(self, bg=COLOR_WHITE, bd=0)
+        self.inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        self.text: tk.Text = tk.Text(
+            self.inner, bd=0, highlightthickness=0, relief="flat",
+            bg=COLOR_WHITE, fg=COLOR_TEXT, font=fonts.log, wrap="word",
+        )
+        self.scroll: tk.Scrollbar = tk.Scrollbar(self.inner, orient="vertical",
+                                                  command=self.text.yview)
+        self.text.configure(yscrollcommand=self.scroll.set)
+
+        self.text.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=8)
+        self.scroll.pack(side="right", fill="y")
+
+    def write(self, message: str) -> None:
+        self.text.insert("end", message.rstrip() + "\n")
+        self.text.see("end")
+
+    def clear(self) -> None:
+        self.text.delete("1.0", "end")
+
+    def set_content(self, lines: list[str]) -> None:
+        self.clear()
+        if lines:
+            self.text.insert("end", "\n".join(lines) + "\n")
+            self.text.see("end")
+
+    def reposition(self, x: int, y: int, height: int) -> None:
+        self.configure(height=height)
+        self.place(x=x, y=y, height=height)
+
+
+class SuraProgressBar(tk.Frame):
+    def __init__(self, master: tk.Misc, width: int, height: int = 10) -> None:
+        super().__init__(master, width=width, height=height, bg=COLOR_BORDER,
+                          bd=0, highlightthickness=0)
+
+        self.width_value: int = width
+        self.height_value: int = height
+        self.pack_propagate(False)
+
+        self.fill: tk.Frame = tk.Frame(self, bg=COLOR_BLUE, bd=0, highlightthickness=0)
+        self.fill.place(x=0, y=0, width=0, height=height)
+
+    def set_progress(self, value: float) -> None:
+        bounded_value: float = max(0.0, min(1.0, value))
+        self.fill.place_configure(width=int(self.width_value * bounded_value))
 # ==================== CONFIGURACIÓN BÁSICA ====================
 
 URL = "https://www.sbs.gob.pe/app/pp/EstadisticasSAEEPortal/Paginas/TIPasivaDepositoEmpresa.aspx?tip=B"
@@ -86,34 +491,96 @@ DESIRED_COLS = [
     "Depósitos CTS",
 ]
 
-# ==================== FERIADOS 2025 ====================
+# ==================== MOTOR DE FERIADOS (Perú) ====================
+#
+# Se separa en tres capas:
+#
+# 1) FIXED_HOLIDAYS_MMDD: feriados nacionales de fecha fija que se repiten
+#    todos los años por ley. Válido para cualquier año.
+#
+# 2) Feriados móviles (Jueves y Viernes Santo): se calculan a partir del
+#    Domingo de Pascua (algoritmo de Meeus/Jones/Butcher), válido para
+#    cualquier año en el calendario gregoriano.
+#
+# 3) ADDITIONAL_NONWORKING_DAYS: días no laborables que se decretan año a
+#    año (normalmente vía Decreto Supremo) y NO siguen una regla calculable
+#    (ej. bicentenarios, puentes administrativos). Esta tabla debe
+#    actualizarse manualmente cada año cuando se publiquen los decretos
+#    correspondientes; no hay forma de predecirla algorítmicamente.
+#
+# "es_nacional=True" => feriado general, afecta también al sector privado
+#   (por lo tanto es esperable que la fuente SBS no tenga dato ese día).
+# "es_nacional=False" => día no laborable declarado solo para el sector
+#   público; el sector privado (y por ende la SBS) podría seguir operando
+#   con normalidad, aunque en la práctica puede que igual no actualice.
 
-HOLIDAYS_2025 = {
-    datetime(2025,  1,  1).date(),
-    datetime(2025,  4, 17).date(),
-    datetime(2025,  4, 18).date(),
-    datetime(2025,  5,  1).date(),
-    datetime(2025,  6,  7).date(),
-    datetime(2025,  6, 29).date(),
-    datetime(2025,  7, 23).date(),
-    datetime(2025,  7, 28).date(),
-    datetime(2025,  7, 29).date(),
-    datetime(2025,  8,  6).date(),
-    datetime(2025,  8, 30).date(),
-    datetime(2025, 10,  8).date(),
-    datetime(2025, 11,  1).date(),
-    datetime(2025, 12,  8).date(),
-    datetime(2025, 12,  9).date(),
-    datetime(2025, 12, 25).date(),
+FIXED_HOLIDAYS_MMDD: dict[tuple[int, int], str] = {
+    (1, 1):   "Año Nuevo",
+    (5, 1):   "Día del Trabajo",
+    (6, 29):  "San Pedro y San Pablo",
+    (7, 28):  "Fiestas Patrias (1er día)",
+    (7, 29):  "Fiestas Patrias (2do día)",
+    (8, 30):  "Santa Rosa de Lima",
+    (10, 8):  "Combate de Angamos",
+    (11, 1):  "Todos los Santos",
+    (12, 8):  "Inmaculada Concepción",
+    (12, 25): "Navidad",
+}
+
+# nombre, es_nacional
+ADDITIONAL_NONWORKING_DAYS: dict[int, dict[tuple[int, int], tuple[str, bool]]] = {
+    2025: {
+        (6, 7):  ("Día de la Bandera", False),
+        (7, 23): ("Día de las Fuerzas Armadas y PNP", False),
+        (8, 6):  ("Bicentenario de la Batalla de Junín", True),
+        (12, 9): ("Bicentenario de la Batalla de Ayacucho", True),
+    },
+    # Agregar aquí los decretos de años siguientes conforme se publiquen.
 }
 
 
-def is_holiday(date_obj: datetime) -> bool:
-    try:
-        d = date_obj.date()
-    except AttributeError:
-        d = date_obj
-    return d in HOLIDAYS_2025 if d.year == 2025 else False
+def easter_sunday(year: int) -> date:
+    """Domingo de Pascua (calendario gregoriano). Algoritmo de Meeus/Jones/Butcher."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def get_holiday_info(d: date) -> tuple[bool, str | None, bool | None]:
+    """
+    Retorna (es_feriado, nombre, es_nacional) para la fecha dada.
+    """
+    mmdd = (d.month, d.day)
+
+    if mmdd in FIXED_HOLIDAYS_MMDD:
+        return True, FIXED_HOLIDAYS_MMDD[mmdd], True
+
+    pascua = easter_sunday(d.year)
+    jueves_santo = pascua - timedelta(days=3)
+    viernes_santo = pascua - timedelta(days=2)
+    if d == jueves_santo:
+        return True, "Jueves Santo", True
+    if d == viernes_santo:
+        return True, "Viernes Santo", True
+
+    extra = ADDITIONAL_NONWORKING_DAYS.get(d.year, {})
+    if mmdd in extra:
+        nombre, es_nacional = extra[mmdd]
+        return True, nombre, es_nacional
+
+    return False, None, None
 
 # ==================== UTILIDADES DE FECHA ====================
 
@@ -131,6 +598,28 @@ def date_range(start_str: str, end_str: str):
     while cur <= end:
         yield cur
         cur += timedelta(days=1)
+
+
+BIMESTRE_MESES = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12)]
+
+
+def bimestre_anterior(hoy: date) -> tuple[date, date]:
+    """
+    Retorna (inicio, fin) del bimestre par-impar (ene-feb, mar-abr, ...)
+    anterior al que contiene la fecha "hoy". Ejemplo: ejecutado el 6 de
+    julio o el 20 de agosto, ambos retornan mayo-junio del mismo año.
+    """
+    idx_actual = (hoy.month - 1) // 2
+    idx_anterior = idx_actual - 1
+    anio = hoy.year
+    if idx_anterior < 0:
+        idx_anterior = 5
+        anio -= 1
+    mes_inicio, mes_fin = BIMESTRE_MESES[idx_anterior]
+    inicio = date(anio, mes_inicio, 1)
+    ultimo_dia = calendar.monthrange(anio, mes_fin)[1]
+    fin = date(anio, mes_fin, ultimo_dia)
+    return inicio, fin
 
 # ==================== PARSE DE TABLAS HTML ====================
 
@@ -599,6 +1088,8 @@ def upsert_to_excel_accum(path: str, new_df: pd.DataFrame, key_cols, sheet_name=
                 pass
 
         return "written"
+    except PermissionError as e:
+        return f"error_write_permiso: {e}"
     except Exception as e:
         return f"error_write: {e}"
 
@@ -781,21 +1272,136 @@ def click_me_tab_and_wait(driver, date_str: str) -> bool:
             time.sleep(0.5)
     return False
 
+
+def consultar_y_parsear_fecha(
+    driver, date_str: str, out_dir: str | None = None, log_fn=print
+) -> dict:
+    """
+    Ejecuta la consulta completa contra la SBS para date_str (Paso 1:
+    Consultar → MN, Paso 2: tab Extranjera → ME) y parsea las tablas
+    resultantes. Levanta una excepción si la consulta en sí falla en
+    cualquiera de sus pasos (fecha rechazada por la SBS, timeout, etc.).
+
+    Retorna un dict con la misma forma que las entradas de la cache
+    "ultimo_ok" de run_date_range, para poder reutilizar tanto el resultado
+    de una fecha del rango como el de una fecha "semilla" anterior al rango.
+    """
+    set_sbs_date(driver, date_str)
+    eff_date, lbl_txt = click_consultar_and_wait(driver, date_str)
+
+    html_mn = driver.page_source
+
+    ok_me = click_me_tab_and_wait(driver, date_str)
+    if not ok_me:
+        log_fn(f"[WARN] {date_str}: postback ME no confirmado. Datos ME omitidos para esta fecha.")
+    html_me = driver.page_source if ok_me else None
+
+    if out_dir is not None:
+        date_suffix = datetime.strptime(date_str, "%d/%m/%Y").strftime("%d%m%Y")
+        html_path = os.path.join(out_dir, f"sbs_fuente_{date_suffix}.html")
+        html_for_file = html_me if html_me is not None else html_mn
+        try:
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html_for_file)
+        except Exception:
+            pass
+
+    mn_general = mn_nat = mn_jur = None
+    tablas_mn_detectadas = 0
+    has_mn, ids_mn = html_has_data(html_mn, RELEVANT_IDS_MN)
+    if not has_mn:
+        log_fn(f"[INFO] No hay tablas MN para {date_str}.")
+    else:
+        tablas_mn_detectadas = len(ids_mn & RELEVANT_IDS_MN)
+        log_fn(f"[INFO] Tablas MN={tablas_mn_detectadas}  detectadas")
+        mn_tables, created_mn = parse_tables_from_html(html_mn, MAPPING_PARSE_MN)
+        for base_name, shape in created_mn:
+            log_fn(f"  MN: {base_name} shape={shape}")
+        mn_general = mn_tables.get("df_tabla10")
+        mn_nat, mn_jur = split_person_tables(mn_tables.get("df_tabla12"))
+
+    me_general = me_nat = me_jur = None
+    tablas_me_detectadas = 0
+    if html_me is None:
+        log_fn(f"[INFO] {date_str}: ME omitido (postback no confirmado).")
+    else:
+        has_me, ids_me = html_has_data(html_me, RELEVANT_IDS_ME)
+        if not has_me:
+            log_fn(f"[INFO] No hay tablas ME para {date_str}.")
+        else:
+            tablas_me_detectadas = len(ids_me & RELEVANT_IDS_ME)
+            log_fn(f"[INFO] Tablas ME={tablas_me_detectadas}  detectadas")
+            me_tables, created_me = parse_tables_from_html(html_me, MAPPING_PARSE_ME)
+            for base_name, shape in created_me:
+                log_fn(f"  ME: {base_name} shape={shape}")
+            me_general = me_tables.get("df_tabla14")
+            me_nat, me_jur = split_person_tables(me_tables.get("df_tabla16"))
+
+    return {
+        "eff_date": eff_date,
+        "mn_general": mn_general, "mn_nat": mn_nat, "mn_jur": mn_jur,
+        "me_general": me_general, "me_nat": me_nat, "me_jur": me_jur,
+        "tablas_mn": tablas_mn_detectadas, "tablas_me": tablas_me_detectadas,
+    }
+
+
+
+
+class DetailLogger:
+    """
+    Registra una fila por cada fecha procesada, pensado para poder filtrar
+    después los casos donde no hubo dato pero debería haberlo habido
+    (es_feriado_registrado = False y tuvo_datos = False), o donde se usó
+    un valor arrastrado de un feriado no registrado en la base de datos.
+    Usa ";" como separador para abrir directamente en Excel con configuración
+    regional de Perú.
+    """
+
+    FIELDNAMES = [
+        "Fecha", "DiaSemana", "EsFinDeSemana",
+        "EsFeriadoRegistrado", "NombreFeriado", "EsNacional",
+        "FechaEfectivaSBS", "HuboArrastre",
+        "TablasMN", "TablasME",
+        "FilasGeneral", "FilasPersona", "TuvoDatos",
+        "Advertencias",
+    ]
+
+    def __init__(self, path: str):
+        self.path = path
+        self._header_escrito = os.path.exists(path)
+
+    def log(self, **kwargs) -> None:
+        fila = {k: kwargs.get(k, "") for k in self.FIELDNAMES}
+        escribir_header = not self._header_escrito
+        with open(self.path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=self.FIELDNAMES, delimiter=";")
+            if escribir_header:
+                writer.writeheader()
+                self._header_escrito = True
+            writer.writerow(fila)
+
 # ==================== PROCESO PRINCIPAL ====================
 
 
 def run_date_range(
-    start_date_str:    str,
-    end_date_str:      str,
-    out_base_dir:      str | None = None,
-    log_fn             = print,
-    simple_log_fn      = None,
-    import_natural:    bool = True,
-    import_juridica:   bool = True,
-    import_general:    bool = True,
-    remove_html_after: bool = False,
-    skip_weekends:     bool = True,
-):
+    start_date_str:      str,
+    end_date_str:        str,
+    out_base_dir:        str | None = None,
+    log_fn                          = print,
+    simple_log_fn                   = None,
+    import_natural:      bool = True,
+    import_juridica:     bool = True,
+    import_general:      bool = True,
+    remove_html_after:   bool = False,
+    skip_weekends:       bool = True,
+    cancel_event: threading.Event | None = None,
+    generate_detail_log: bool = False,
+    progress_fn=None,
+) -> str:
+    """
+    Retorna uno de: "completado", "cancelado", "error_chrome",
+    "error_navegacion". Cualquier otro fallo se propaga como excepción.
+    """
     if simple_log_fn is not None:
         simple_log_fn(f"Iniciando proceso desde {start_date_str} hasta {end_date_str}.")
 
@@ -807,30 +1413,117 @@ def run_date_range(
     file_general   = os.path.join(out_dir, f"TPF_General_{range_tag}.xlsx")
     file_by_person = os.path.join(out_dir, f"TPF_Persona_{range_tag}.xlsx")
 
+    detail_logger = None
+    if generate_detail_log:
+        detail_path = os.path.join(out_dir, f"LOG_Detalle_{range_tag}.csv")
+        detail_logger = DetailLogger(detail_path)
+        log_fn(f"[INFO] Log detallado habilitado: {detail_path}")
+
     log_fn(f"[INFO] Carpeta de salida: {out_dir}")
 
-    driver = webdriver.Chrome()
-    driver.get(URL)
-    time.sleep(2)
+    try:
+        driver = webdriver.Chrome()
+    except Exception as e:
+        log_fn(f"[ERROR] No se pudo iniciar Google Chrome: {e}")
+        log_fn("        Verificar que Chrome esté instalado y actualizado en el equipo.")
+        if simple_log_fn is not None:
+            simple_log_fn("No se pudo iniciar Chrome. Verificar instalación.")
+        return "error_chrome"
+
+    try:
+        driver.get(URL)
+        time.sleep(2)
+    except Exception as e:
+        log_fn(f"[ERROR] No se pudo cargar la página de la SBS: {e}")
+        if simple_log_fn is not None:
+            simple_log_fn("No se pudo cargar la página de la SBS. Verificar la conexión a internet.")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        return "error_navegacion"
 
     overall_export_results = []
+    fue_cancelado = False
+    ultimo_ok: dict | None = None  # cache de la última fecha con datos reales (ver PASO 1)
+
+    # Sembrar la cache con el último valor disponible ANTES del inicio del
+    # rango. Sin esto, si el primer día del rango es justo un feriado real
+    # (la SBS rechaza la consulta, no solo "no tiene dato nuevo"), no hay
+    # nada de qué arrastrar y ese día queda sin fila. Se retrocede día a día
+    # hasta encontrar una consulta que funcione (máximo 15 intentos).
+    log_fn("[INFO] Buscando un valor previo al rango para poder completar el primer día si hiciera falta...")
+    _semilla_dt = parse_ddmmyyyy(start_date_str) - timedelta(days=1)
+    for _ in range(15):
+        _semilla_str = _semilla_dt.strftime("%d/%m/%Y")
+        try:
+            _semilla = consultar_y_parsear_fecha(driver, _semilla_str, out_dir=None, log_fn=log_fn)
+            if _semilla["mn_general"] is not None or _semilla["me_general"] is not None:
+                ultimo_ok = {
+                    "origen": _semilla["eff_date"] or _semilla_str,
+                    "mn_general": _semilla["mn_general"], "mn_nat": _semilla["mn_nat"],
+                    "mn_jur": _semilla["mn_jur"],
+                    "me_general": _semilla["me_general"], "me_nat": _semilla["me_nat"],
+                    "me_jur": _semilla["me_jur"],
+                    "tablas_mn": _semilla["tablas_mn"], "tablas_me": _semilla["tablas_me"],
+                }
+                log_fn(f"[INFO] Valor semilla obtenido de {ultimo_ok['origen']}.")
+                break
+        except Exception:
+            pass
+        _semilla_dt -= timedelta(days=1)
+
+    if ultimo_ok is None:
+        log_fn(
+            "[WARN] No se encontró ningún valor previo al rango para sembrar el arrastre. "
+            "Si el primer día del rango no tiene dato propio, quedará sin fila."
+        )
+
+    _total_dias = max(
+        1, (parse_ddmmyyyy(end_date_str).date() - parse_ddmmyyyy(start_date_str).date()).days + 1
+    )
+    _dias_procesados = 0
 
     try:
         for dt in date_range(start_date_str, end_date_str):
+
+            _dias_procesados += 1
+            if progress_fn is not None:
+                try:
+                    progress_fn(_dias_procesados / _total_dias)
+                except Exception:
+                    pass
+
+            if cancel_event is not None and cancel_event.is_set():
+                fue_cancelado = True
+                log_fn("")
+                log_fn("[INFO] Proceso detenido por el usuario. Cancelando el resto del rango.")
+                if simple_log_fn is not None:
+                    simple_log_fn("Proceso detenido por el usuario.")
+                break
+
             date_str   = dt.strftime("%d/%m/%Y")
             is_weekend = dt.weekday() >= 5
+            advertencias: list[str] = []
 
             if skip_weekends and is_weekend:
-                log_fn(f"[INFO] Saltando fin de semana {date_str}.")
+                log_fn(f"[INFO] Omitiendo fin de semana {date_str}.")
                 if simple_log_fn is not None:
                     simple_log_fn(f"{date_str}: omitido (fin de semana).")
+                if detail_logger:
+                    detail_logger.log(
+                        Fecha=date_str, DiaSemana=dt.strftime("%A"),
+                        EsFinDeSemana=True, TuvoDatos=False,
+                    )
                 continue
 
-            if is_holiday(dt):
-                log_fn(f"[INFO] Saltando feriado {date_str}.")
-                if simple_log_fn is not None:
-                    simple_log_fn(f"{date_str}: omitido (feriado).")
-                continue
+            es_feriado, nombre_feriado, es_nacional = get_holiday_info(dt.date())
+            if es_feriado:
+                tipo = "feriado nacional" if es_nacional else "día no laborable (sector público)"
+                log_fn(
+                    f"[INFO] {date_str}: {nombre_feriado} — {tipo} (registrado en la base de "
+                    f"datos). Se consulta igual para completar con el último valor disponible."
+                )
 
             date_suffix       = dt.strftime("%d%m%Y")
             had_data_for_date = False
@@ -840,75 +1533,113 @@ def run_date_range(
             log_fn(f"Procesando fecha {date_str} (sufijo: {date_suffix})")
             log_fn("=" * 60)
 
-            html_path = os.path.join(out_dir, f"sbs_fuente_{date_suffix}.html")
+            uso_cache = False
+            origen_arrastre = date_str
 
-            # ===== Paso 1: Click Consultar → MN se actualiza =====
+            # ===== Consultar la fecha (Paso 1 MN + Paso 2 ME + parseo) =====
             try:
-                set_sbs_date(driver, date_str)
-                eff_date, lbl_txt = click_consultar_and_wait(driver, date_str)
+                resultado = consultar_y_parsear_fecha(driver, date_str, out_dir=out_dir, log_fn=log_fn)
+                eff_date   = resultado["eff_date"]
+                mn_general = resultado["mn_general"]
+                mn_nat     = resultado["mn_nat"]
+                mn_jur     = resultado["mn_jur"]
+                me_general = resultado["me_general"]
+                me_nat     = resultado["me_nat"]
+                me_jur     = resultado["me_jur"]
+                tablas_mn_detectadas = resultado["tablas_mn"]
+                tablas_me_detectadas = resultado["tablas_me"]
             except Exception as e:
-                log_fn(f"[ERROR] No se pudo consultar la fecha {date_str}: {e}")
-                if simple_log_fn is not None:
-                    simple_log_fn(f"{date_str}: error al consultar en la SBS.")
-                continue
-
-            if eff_date and eff_date != date_str:
-                log_fn(
-                    f"[INFO] {date_str}: SBS reporta data vigente al {eff_date}. "
-                    f"Se omite para evitar fecha inválida."
-                )
-                if simple_log_fn is not None:
-                    simple_log_fn(f"{date_str}: omitido (SBS vigente al {eff_date}).")
-                continue
-
-            # Capturar MN desde el page_source post-Consultar
-            html_mn = driver.page_source
-
-            # ===== Paso 2: Click tab ME → ME se actualiza =====
-            # El label cambiará a "Extranjera... al DATE" cuando el postback ME termine.
-            ok_me = click_me_tab_and_wait(driver, date_str)
-            if not ok_me:
-                log_fn(f"[WARN] {date_str}: postback ME no confirmado. Datos ME omitidos para esta fecha.")
-
-            # Capturar ME solo si el postback fue confirmado
-            html_me = driver.page_source if ok_me else None
-
-            # Guardar HTML del día: si ME fue confirmado usamos ese, si no usamos MN
-            html_for_file = html_me if html_me is not None else html_mn
-            try:
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(html_for_file)
-            except Exception:
-                pass
-
-            # ===== Parsear MN desde html_mn (post-Consultar) =====
-            mn_general = mn_nat = mn_jur = None
-            has_mn, ids_mn = html_has_data(html_mn, RELEVANT_IDS_MN)
-            if not has_mn:
-                log_fn(f"[INFO] No hay tablas MN para {date_str}.")
-            else:
-                log_fn(f"[INFO] Tablas MN={len(ids_mn & RELEVANT_IDS_MN)}  detectadas")
-                mn_tables, created_mn = parse_tables_from_html(html_mn, MAPPING_PARSE_MN)
-                for base_name, shape in created_mn:
-                    log_fn(f"  MN: {base_name} shape={shape}")
-                mn_general = mn_tables.get("df_tabla10")
-                mn_nat, mn_jur = split_person_tables(mn_tables.get("df_tabla12"))
-
-            # ===== Parsear ME desde html_me (post-tab-click confirmado) =====
-            me_general = me_nat = me_jur = None
-            if html_me is None:
-                log_fn(f"[INFO] {date_str}: ME omitido (postback no confirmado).")
-            else:
-                has_me, ids_me = html_has_data(html_me, RELEVANT_IDS_ME)
-                if not has_me:
-                    log_fn(f"[INFO] No hay tablas ME para {date_str}.")
+                # En un feriado real la SBS puede directamente rechazar la
+                # consulta (el datepicker no habilita "Consultar", o el
+                # postback nunca completa) en vez de responder con la fecha
+                # vigente anterior. Lo mismo puede pasar por cualquier otro
+                # fallo puntual de red/render. En ese caso no sirve esperar a
+                # que la SBS "avise" la fecha vigente (mecanismo usado más
+                # abajo): hay que arrastrar directamente desde la última
+                # consulta exitosa que se tiene en memoria (incluida la
+                # "semilla" previa al rango), sin volver a tocar el navegador.
+                if ultimo_ok is not None:
+                    uso_cache = True
+                    origen_arrastre = ultimo_ok["origen"]
                 else:
-                    log_fn(f"[INFO] Tablas ME={len(ids_me & RELEVANT_IDS_ME)}  detectadas")
-                    me_tables, created_me = parse_tables_from_html(html_me, MAPPING_PARSE_ME)
-                    for base_name, shape in created_me:
-                        log_fn(f"  ME: {base_name} shape={shape}")
-                    me_general = me_tables.get("df_tabla14")
-                    me_nat, me_jur = split_person_tables(me_tables.get("df_tabla16"))
+                    log_fn(f"[ERROR] No se pudo consultar la fecha {date_str}: {e}")
+                    if simple_log_fn is not None:
+                        simple_log_fn(f"{date_str}: error al consultar en la SBS.")
+                    if detail_logger:
+                        detail_logger.log(
+                            Fecha=date_str, DiaSemana=dt.strftime("%A"),
+                            EsFinDeSemana=False, EsFeriadoRegistrado=es_feriado,
+                            NombreFeriado=nombre_feriado or "",
+                            EsNacional=es_nacional if es_nacional is not None else "",
+                            TuvoDatos=False,
+                            Advertencias=f"Error al consultar y sin dato previo para arrastrar: {e}",
+                        )
+                    continue
+
+            hubo_arrastre = False
+
+            if uso_cache:
+                hubo_arrastre = True
+                mn_general = ultimo_ok["mn_general"]
+                mn_nat     = ultimo_ok["mn_nat"]
+                mn_jur     = ultimo_ok["mn_jur"]
+                me_general = ultimo_ok["me_general"]
+                me_nat     = ultimo_ok["me_nat"]
+                me_jur     = ultimo_ok["me_jur"]
+                tablas_mn_detectadas = ultimo_ok["tablas_mn"]
+                tablas_me_detectadas = ultimo_ok["tablas_me"]
+
+                if es_feriado:
+                    msg = (
+                        f"{date_str}: {nombre_feriado} ({tipo}). La SBS no permitió consultar "
+                        f"esta fecha; se completa con el valor de {origen_arrastre}."
+                    )
+                    log_fn(f"[INFO] {msg}")
+                    if simple_log_fn is not None:
+                        simple_log_fn(f"{date_str}: {nombre_feriado} — se usó el valor de {origen_arrastre}.")
+                else:
+                    msg = (
+                        f"{date_str}: no se pudo consultar en la SBS y esta fecha NO está "
+                        f"registrada como feriado/no laborable en la base de datos interna. "
+                        f"Se completa con el valor de {origen_arrastre}. Evaluar si corresponde "
+                        f"agregar esta fecha a la base de feriados."
+                    )
+                    log_fn(f"[WARN] {msg}")
+                    advertencias.append(msg)
+                    if simple_log_fn is not None:
+                        simple_log_fn(
+                            f"{date_str}: ⚠ error al consultar y feriado no registrado — "
+                            f"se usó el valor de {origen_arrastre}."
+                        )
+
+            elif eff_date and eff_date != date_str:
+                # Sin dato propio para esta fecha, pero la SBS sí respondió con
+                # la fecha vigente anterior (a diferencia del caso de arriba,
+                # donde directamente rechaza la consulta). Se arrastra ese valor.
+                hubo_arrastre = True
+                origen_arrastre = eff_date
+                if es_feriado:
+                    msg = (
+                        f"{date_str}: {nombre_feriado} ({tipo}). Sin dato propio en la SBS; "
+                        f"se completa con el valor de {eff_date}."
+                    )
+                    log_fn(f"[INFO] {msg}")
+                    if simple_log_fn is not None:
+                        simple_log_fn(f"{date_str}: {nombre_feriado} — se usó el valor de {eff_date}.")
+                else:
+                    msg = (
+                        f"{date_str}: la SBS no tiene data propia; indica vigente al {eff_date}. "
+                        f"Esta fecha NO está registrada como feriado/no laborable en la base de "
+                        f"datos interna. Se usará el valor de {eff_date} para completar {date_str}. "
+                        f"Evaluar si corresponde agregar esta fecha a la base de feriados."
+                    )
+                    log_fn(f"[WARN] {msg}")
+                    advertencias.append(msg)
+                    if simple_log_fn is not None:
+                        simple_log_fn(
+                            f"{date_str}: ⚠ feriado no registrado en la base de datos — "
+                            f"se usó el valor de {eff_date}."
+                        )
 
             # ===== Armar y exportar =====
             general_rows = (
@@ -929,38 +1660,95 @@ def run_date_range(
                 if person_rows.empty:
                     person_rows = None
 
+            filas_general_n = 0
+            filas_persona_n = 0
+
             if general_rows is not None and not general_rows.empty:
                 had_data_for_date = True
+                filas_general_n = len(general_rows)
                 res = upsert_to_excel_accum(
                     file_general, general_rows, ["Fecha", "Tipo de Moneda", "Banco"]
                 )
                 overall_export_results.append(
-                    (file_general, date_suffix, res, f"rows={len(general_rows)}")
+                    (file_general, date_suffix, res, f"rows={filas_general_n}")
                 )
-                log_fn(
-                    f"[EXPORT] General -> {os.path.basename(file_general)}: "
-                    f"{res} ({len(general_rows)} filas)"
-                )
+                if isinstance(res, str) and res.startswith("error_write"):
+                    msg = (
+                        f"No se pudo escribir {os.path.basename(file_general)}: {res}. "
+                        f"Verificar que el archivo no esté abierto en Excel u otra aplicación."
+                    )
+                    log_fn(f"[ERROR] {msg}")
+                    advertencias.append(msg)
+                    if simple_log_fn is not None:
+                        simple_log_fn(
+                            f"{date_str}: ⚠ error al guardar en "
+                            f"{os.path.basename(file_general)} (¿archivo abierto?)."
+                        )
+                else:
+                    log_fn(
+                        f"[EXPORT] General -> {os.path.basename(file_general)}: "
+                        f"{res} ({filas_general_n} filas)"
+                    )
 
             if person_rows is not None and not person_rows.empty:
                 had_data_for_date = True
+                filas_persona_n = len(person_rows)
                 res2 = upsert_to_excel_accum(
                     file_by_person, person_rows,
                     ["Fecha", "Tipo de Moneda", "Tipo Persona", "Banco"],
                 )
                 overall_export_results.append(
-                    (file_by_person, date_suffix, res2, f"rows={len(person_rows)}")
+                    (file_by_person, date_suffix, res2, f"rows={filas_persona_n}")
                 )
-                log_fn(
-                    f"[EXPORT] Por tipo de persona -> {os.path.basename(file_by_person)}: "
-                    f"{res2} ({len(person_rows)} filas)"
-                )
+                if isinstance(res2, str) and res2.startswith("error_write"):
+                    msg = (
+                        f"No se pudo escribir {os.path.basename(file_by_person)}: {res2}. "
+                        f"Verificar que el archivo no esté abierto en Excel u otra aplicación."
+                    )
+                    log_fn(f"[ERROR] {msg}")
+                    advertencias.append(msg)
+                    if simple_log_fn is not None:
+                        simple_log_fn(
+                            f"{date_str}: ⚠ error al guardar en "
+                            f"{os.path.basename(file_by_person)} (¿archivo abierto?)."
+                        )
+                else:
+                    log_fn(
+                        f"[EXPORT] Por tipo de persona -> {os.path.basename(file_by_person)}: "
+                        f"{res2} ({filas_persona_n} filas)"
+                    )
+
+            # Si esta fecha se resolvió con datos frescos (no desde cache), la
+            # guardamos como la nueva "última consulta exitosa" para que fechas
+            # futuras que fallen (feriados reales, errores puntuales) puedan
+            # arrastrar desde acá sin depender de que la SBS responda.
+            if not uso_cache and had_data_for_date:
+                ultimo_ok = {
+                    "origen": origen_arrastre,
+                    "mn_general": mn_general, "mn_nat": mn_nat, "mn_jur": mn_jur,
+                    "me_general": me_general, "me_nat": me_nat, "me_jur": me_jur,
+                    "tablas_mn": tablas_mn_detectadas, "tablas_me": tablas_me_detectadas,
+                }
 
             if simple_log_fn is not None:
                 if had_data_for_date:
                     simple_log_fn(f"{date_str} descargado exitosamente ✅")
                 else:
                     simple_log_fn(f"{date_str}: sin datos disponibles.")
+
+            if detail_logger:
+                detail_logger.log(
+                    Fecha=date_str, DiaSemana=dt.strftime("%A"),
+                    EsFinDeSemana=False, EsFeriadoRegistrado=es_feriado,
+                    NombreFeriado=nombre_feriado or "",
+                    EsNacional=es_nacional if es_nacional is not None else "",
+                    FechaEfectivaSBS=origen_arrastre,
+                    HuboArrastre=hubo_arrastre,
+                    TablasMN=tablas_mn_detectadas, TablasME=tablas_me_detectadas,
+                    FilasGeneral=filas_general_n, FilasPersona=filas_persona_n,
+                    TuvoDatos=had_data_for_date,
+                    Advertencias="; ".join(advertencias),
+                )
 
     finally:
         try:
@@ -970,8 +1758,8 @@ def run_date_range(
 
     log_fn("")
     log_fn("Resumen exportaciones:")
-    for fp, var, action, details in overall_export_results:
-        log_fn(f" - {os.path.basename(fp)} | sufijo={var} | {action} | {details}")
+    for fp, suf, action, details in overall_export_results:
+        log_fn(f" - {os.path.basename(fp)} | sufijo={suf} | {action} | {details}")
     if not overall_export_results:
         log_fn(" - No se encontraron datos en el rango especificado.")
 
@@ -986,192 +1774,415 @@ def run_date_range(
                     pass
         log_fn(f"[INFO] Eliminados {removed} archivos temporales HTML.")
 
+    if progress_fn is not None and not fue_cancelado:
+        try:
+            progress_fn(1.0)
+        except Exception:
+            pass
+
+    return "cancelado" if fue_cancelado else "completado"
 # ==================== INTERFAZ TKINTER ====================
 
 
-class TasasApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Tasas Pasivas SBS - Rango de fechas")
-        self.geometry("840x640")
-        self.minsize(840, 480)
+class TasasApp:
+    def __init__(self) -> None:
+        enable_windows_dpi_awareness()
+        load_bundled_fonts()
 
-        main = ttk.Frame(self, padding=8)
-        main.pack(fill="both", expand=True)
+        self.root: tk.Tk = tk.Tk()
+        self.root.title(f"SURA INVESTMENTS | {APP_NAME}")
+        self.root.geometry(f"{APP_WIDTH}x{APP_HEIGHT}")
+        self.root.resizable(False, False)
+        self.root.minsize(APP_WIDTH, APP_HEIGHT)
+        self.root.maxsize(APP_WIDTH, APP_HEIGHT)
+        self.root.configure(bg=COLOR_WHITE)
 
-        lf_range = ttk.LabelFrame(main, text="Rango de fechas")
-        lf_range.pack(fill="x", pady=(0, 6))
+        self.fonts: FontSet = FontSet(self.root)
+        self._images: list[tk.PhotoImage] = []
 
-        top = ttk.Frame(lf_range)
-        top.pack(anchor="w", pady=4, padx=4)
+        self.worker: threading.Thread | None = None
+        self.cancel_event = threading.Event()
+        self._worker_status: str | None = None
 
-        ttk.Label(top, text="Fecha inicio:").grid(column=0, row=0, sticky="w")
-        self.s_day   = ttk.Entry(top, width=3, justify="center", validate="key")
-        self.s_month = ttk.Entry(top, width=3, justify="center", validate="key")
-        self.s_year  = ttk.Entry(top, width=6, justify="center", validate="key")
-        ttk.Label(top, text="/").grid(column=2, row=0)
-        ttk.Label(top, text="/").grid(column=4, row=0)
-        self.s_day.grid(  column=1, row=0, padx=(2, 2))
-        self.s_month.grid(column=3, row=0, padx=(2, 2))
-        self.s_year.grid( column=5, row=0, padx=(2, 20))
+        self._log_simple_lines: list[str] = []
+        self._log_advanced_lines: list[str] = []
+        self._console_mode: str = "simple"
 
-        ttk.Label(top, text="Fecha fin:").grid(column=6, row=0, sticky="w")
-        self.e_day   = ttk.Entry(top, width=3, justify="center", validate="key")
-        self.e_month = ttk.Entry(top, width=3, justify="center", validate="key")
-        self.e_year  = ttk.Entry(top, width=6, justify="center", validate="key")
-        ttk.Label(top, text="/").grid(column=8,  row=0)
-        ttk.Label(top, text="/").grid(column=10, row=0)
-        self.e_day.grid(  column=7,  row=0, padx=(2, 2))
-        self.e_month.grid(column=9,  row=0, padx=(2, 2))
-        self.e_year.grid( column=11, row=0, padx=(2, 2))
+        self._set_window_icon()
+        self._build_ui()
+        self._center_window()
+        self._set_default_dates()
 
-        ttk.Label(lf_range, text="Formato: DD / MM / AAAA").pack(
-            anchor="w", padx=4, pady=(0, 4)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ---------------------------------------------------------------- infra
+
+    def _center_window(self) -> None:
+        screen_width: int = self.root.winfo_screenwidth()
+        screen_height: int = self.root.winfo_screenheight()
+        pos_x: int = max(0, (screen_width - APP_WIDTH) // 2)
+        pos_y: int = max(0, (screen_height - APP_HEIGHT) // 2)
+        self.root.geometry(f"{APP_WIDTH}x{APP_HEIGHT}+{pos_x}+{pos_y}")
+
+    def _load_photo(self, relative_path: str) -> tk.PhotoImage | None:
+        path: str = resource_path(relative_path)
+        if not os.path.exists(path):
+            return None
+        try:
+            image: tk.PhotoImage = tk.PhotoImage(file=path)
+            self._images.append(image)
+            return image
+        except Exception:
+            return None
+
+    def _set_window_icon(self) -> None:
+        # Ala según el tema de la PC donde se ejecuta:
+        #   modo claro  -> ala negra  (app_dark.ico)
+        #   modo oscuro -> ala blanca (app_light.ico)
+        dark_mode: bool = is_windows_dark_mode()
+        ico_name: str = "assets/icons/app_light.ico" if dark_mode else "assets/icons/app_dark.ico"
+        ico_path: str = resource_path(ico_name)
+
+        if sys.platform == "win32":
+            if os.path.exists(ico_path):
+                try:
+                    self.root.iconbitmap(default=ico_path)
+                except Exception:
+                    pass
+            return
+
+        png_name: str = "assets/icons/favicon_light.png" if dark_mode else "assets/icons/favicon_dark.png"
+        icon: tk.PhotoImage | None = self._load_photo(png_name)
+        if icon is None:
+            icon = self._load_photo("assets/icons/favicon.png")
+        if icon is not None:
+            try:
+                self.root.iconphoto(True, icon)
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- build
+
+    def _build_ui(self) -> None:
+        self._build_header()
+        self._build_title_area()
+        self._build_form_panel()
+        self._build_advanced_toggle()
+        self._build_log_area()
+        self._build_action_bar()
+        self._reposition_log_area()
+
+    def _build_header(self) -> None:
+        header: tk.Canvas = tk.Canvas(
+            self.root, width=APP_WIDTH, height=HEADER_HEIGHT,
+            bg=COLOR_BLACK, bd=0, highlightthickness=0,
+        )
+        header.place(x=0, y=0)
+
+        banner: tk.PhotoImage | None = self._load_photo("assets/banners/header.png")
+        if banner is not None:
+            header.create_image(0, 0, image=banner, anchor="nw")
+        else:
+            header.create_text(
+                APP_WIDTH // 2, HEADER_HEIGHT // 2, text="SURA  INVESTMENTS",
+                fill=COLOR_WHITE, font=(self.fonts.brand, 26, "bold"),
+            )
+
+        accent: tk.Frame = tk.Frame(self.root, bg=COLOR_BLUE)
+        accent.place(x=0, y=HEADER_HEIGHT, width=APP_WIDTH, height=ACCENT_HEIGHT)
+
+    def _build_title_area(self) -> None:
+        tk.Label(
+            self.root, text=APP_NAME, bg=COLOR_WHITE, fg=COLOR_BLACK,
+            font=self.fonts.title, anchor="w",
+        ).place(x=MARGIN_X, y=TITLE_Y, width=APP_WIDTH - 2 * MARGIN_X, height=36)
+
+        tk.Frame(self.root, bg=COLOR_BORDER).place(
+            x=MARGIN_X, y=SEPARATOR_Y, width=APP_WIDTH - 2 * MARGIN_X, height=1,
         )
 
-        vcmd_day  = (self.register(self._validate_digits_len), "%P", "2")
-        vcmd_year = (self.register(self._validate_digits_len), "%P", "4")
-        for w in (self.s_day, self.s_month, self.e_day, self.e_month):
-            w.config(validate="key", validatecommand=vcmd_day)
-        for w in (self.s_year, self.e_year):
-            w.config(validate="key", validatecommand=vcmd_year)
+        tk.Label(
+            self.root, text=APP_SUBTITLE, bg=COLOR_WHITE, fg=COLOR_TEXT,
+            font=self.fonts.subtitle, anchor="w",
+        ).place(x=MARGIN_X, y=SUBTITLE_Y, width=APP_WIDTH - 2 * MARGIN_X, height=24)
 
-        lf_out     = ttk.LabelFrame(main, text="Salida")
-        lf_out.pack(fill="x", pady=(0, 6))
-        folder_row = ttk.Frame(lf_out)
-        folder_row.pack(fill="x", pady=4)
-        ttk.Label(folder_row, text="Carpeta base de salida:").pack(side="left")
-        self.out_var   = tk.StringVar(value=os.getcwd())
-        self.out_entry = ttk.Entry(folder_row, textvariable=self.out_var, width=60)
-        self.out_entry.pack(side="left", padx=6)
-        ttk.Button(folder_row, text="Cambiar...", command=self.choose_folder).pack(side="left")
+    def _build_form_panel(self) -> None:
+        panel_width: int = APP_WIDTH - 2 * MARGIN_X
+        inner_width: int = panel_width - 2
 
-        box = ttk.LabelFrame(main, text="Opciones de importación")
-        box.pack(fill="x", pady=6)
+        # Alturas de fila: fechas (64) + carpeta de salida (52) + importación (52)
+        row_h_dates = 64
+        row_h_folder = 52
+        row_h_import = 52
+        self._form_height = row_h_dates + row_h_folder + row_h_import
+
+        form_panel: tk.Frame = tk.Frame(self.root, bg=COLOR_BORDER, bd=0, highlightthickness=0)
+        form_panel.place(x=MARGIN_X, y=FORM_Y, width=panel_width, height=self._form_height + 2)
+
+        inner: tk.Frame = tk.Frame(form_panel, bg=COLOR_WHITE, bd=0, highlightthickness=0)
+        inner.place(x=1, y=1, width=inner_width, height=self._form_height)
+
+        self._build_dates_row(inner, inner_width, row_h_dates, y=0, row_bg=COLOR_WHITE)
+
+        folder_row = SuraInputRow(
+            inner, label_text="Carpeta de salida", fonts=self.fonts, row_width=inner_width,
+            command=self._choose_folder, button_text="Cambiar...", row_bg=COLOR_ROW_ALT,
+        )
+        folder_row.place(x=0, y=row_h_dates, width=inner_width, height=row_h_folder)
+        self.folder_entry = folder_row.entry
+        self.folder_entry.set(str(default_output_dir()))
+
+        self._build_import_row(
+            inner, inner_width, row_h_import, y=row_h_dates + row_h_folder, row_bg=COLOR_WHITE,
+        )
+
+        self._form_end_y = FORM_Y + self._form_height + 2
+
+    def _build_dates_row(self, parent: tk.Misc, row_width: int, row_h: int, y: int, row_bg: str) -> None:
+        row = tk.Frame(parent, bg=row_bg, bd=0, highlightthickness=0)
+        row.place(x=0, y=y, width=row_width, height=row_h)
+
+        label_x = 24
+        control_h = 36
+        control_y = (row_h - control_h) // 2
+
+        tk.Label(
+            row, text="Fecha inicio", bg=row_bg, fg=COLOR_TEXT, font=self.fonts.label, anchor="w",
+        ).place(x=label_x, y=0, width=110, height=row_h)
+
+        x = label_x + 110
+        self.s_day = SuraEntry(row, width=44, height=control_h, font=self.fonts.input)
+        self.s_day.place(x=x, y=control_y); x += 44 + 4
+        tk.Label(row, text="/", bg=row_bg, fg=COLOR_TEXT_MUTED, font=self.fonts.input).place(
+            x=x, y=control_y, width=10, height=control_h); x += 14
+        self.s_month = SuraEntry(row, width=44, height=control_h, font=self.fonts.input)
+        self.s_month.place(x=x, y=control_y); x += 44 + 4
+        tk.Label(row, text="/", bg=row_bg, fg=COLOR_TEXT_MUTED, font=self.fonts.input).place(
+            x=x, y=control_y, width=10, height=control_h); x += 14
+        self.s_year = SuraEntry(row, width=70, height=control_h, font=self.fonts.input)
+        self.s_year.place(x=x, y=control_y); x += 70 + 32
+
+        tk.Label(
+            row, text="Fecha fin", bg=row_bg, fg=COLOR_TEXT, font=self.fonts.label, anchor="w",
+        ).place(x=x, y=0, width=90, height=row_h)
+        x += 90
+
+        self.e_day = SuraEntry(row, width=44, height=control_h, font=self.fonts.input)
+        self.e_day.place(x=x, y=control_y); x += 44 + 4
+        tk.Label(row, text="/", bg=row_bg, fg=COLOR_TEXT_MUTED, font=self.fonts.input).place(
+            x=x, y=control_y, width=10, height=control_h); x += 14
+        self.e_month = SuraEntry(row, width=44, height=control_h, font=self.fonts.input)
+        self.e_month.place(x=x, y=control_y); x += 44 + 4
+        tk.Label(row, text="/", bg=row_bg, fg=COLOR_TEXT_MUTED, font=self.fonts.input).place(
+            x=x, y=control_y, width=10, height=control_h); x += 14
+        self.e_year = SuraEntry(row, width=70, height=control_h, font=self.fonts.input)
+        self.e_year.place(x=x, y=control_y); x += 70 + 24
+
+        tk.Label(
+            row, text="Formato DD/MM/AAAA — por defecto, bimestre anterior al actual",
+            bg=row_bg, fg=COLOR_TEXT_MUTED, font=self.fonts.status, anchor="w",
+        ).place(x=x, y=0, width=row_width - x - 20, height=row_h)
+
+        vcmd_day = (self.root.register(self._validate_digits_len), "%P", "2")
+        vcmd_year = (self.root.register(self._validate_digits_len), "%P", "4")
+        for e in (self.s_day, self.s_month, self.e_day, self.e_month):
+            e.configure_validation(vcmd_day)
+        for e in (self.s_year, self.e_year):
+            e.configure_validation(vcmd_year)
+
+    def _build_import_row(self, parent: tk.Misc, row_width: int, row_h: int, y: int, row_bg: str) -> None:
+        row = tk.Frame(parent, bg=row_bg, bd=0, highlightthickness=0)
+        row.place(x=0, y=y, width=row_width, height=row_h)
+
+        tk.Label(
+            row, text="Importar", bg=row_bg, fg=COLOR_TEXT, font=self.fonts.label, anchor="w",
+        ).place(x=24, y=0, width=110, height=row_h)
+
         self.var_nat = tk.BooleanVar(value=True)
         self.var_jur = tk.BooleanVar(value=True)
         self.var_gen = tk.BooleanVar(value=True)
-        ttk.Checkbutton(box, text="Importar Personas Naturales",           variable=self.var_nat).pack(side="left", padx=6, pady=6)
-        ttk.Checkbutton(box, text="Importar Personas Jurídicas",           variable=self.var_jur).pack(side="left", padx=6, pady=6)
-        ttk.Checkbutton(box, text="Importar Tasas sin distinguir persona", variable=self.var_gen).pack(side="left", padx=6, pady=6)
 
-        self.adv_btn = ttk.Button(main, text="Opciones avanzadas ▸", command=self.toggle_advanced)
-        self.adv_btn.pack(anchor="w")
+        checks = [
+            (self.var_nat, "Personas Naturales", 134, 190),
+            (self.var_jur, "Personas Jurídicas", 190, 190),
+            (self.var_gen, "Tasas sin distinguir persona", 190, 260),
+        ]
+        x = 134
+        for var, text, _w, cw in checks:
+            self._checkbox(row, text, var, x, row_h, row_bg)
+            x += cw
 
-        self.adv_frame   = ttk.LabelFrame(main, text="Opciones avanzadas")
-        adv_opts_row     = ttk.Frame(self.adv_frame)
-        adv_opts_row.pack(fill="x", padx=4, pady=4)
+    def _checkbox(self, parent: tk.Misc, text: str, var: tk.BooleanVar, x: int,
+                  row_h: int, row_bg: str) -> tk.Checkbutton:
+        cb = tk.Checkbutton(
+            parent, text=text, variable=var, bg=row_bg, fg=COLOR_TEXT,
+            activebackground=row_bg, activeforeground=COLOR_TEXT,
+            selectcolor=COLOR_WHITE, font=self.fonts.checkbox,
+            bd=0, highlightthickness=0, cursor="hand2", anchor="w",
+        )
+        cb.place(x=x, y=0, height=row_h)
+        return cb
+
+    def _build_advanced_toggle(self) -> None:
+        self.adv_shown = False
+        self.adv_toggle_btn = SuraButton(
+            self.root, text="Opciones avanzadas ▸", command=self.toggle_advanced,
+            variant="secondary", width=200, height=30, font=self.fonts.button,
+        )
+        self._adv_toggle_y = self._form_end_y + 14
+        self.adv_toggle_btn.place(x=MARGIN_X, y=self._adv_toggle_y)
+
+        panel_width = APP_WIDTH - 2 * MARGIN_X
+        self._adv_panel_height = 52
+        self.adv_panel = tk.Frame(self.root, bg=COLOR_BORDER, bd=0, highlightthickness=0)
+        adv_inner = tk.Frame(self.adv_panel, bg=COLOR_WHITE, bd=0, highlightthickness=0)
+        adv_inner.place(x=1, y=1, width=panel_width - 2, height=self._adv_panel_height - 2)
 
         self.var_skip_weekends = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            adv_opts_row, text="Omitir sábados y domingos en el rango",
-            variable=self.var_skip_weekends,
-        ).pack(side="left", padx=4)
-
         self.var_remove_html = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            adv_opts_row, text="Eliminar archivos HTML temporales al terminar",
-            variable=self.var_remove_html,
-        ).pack(side="left", padx=4)
-
         self.var_show_adv_console = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            adv_opts_row, text="Mostrar consola avanzada",
-            variable=self.var_show_adv_console,
-            command=self.toggle_advanced_console,
-        ).pack(side="left", padx=4)
+        self.var_detail_log = tk.BooleanVar(value=False)
 
-        self.adv_shown       = False
-        self.current_console = "simple"
-
-        self.ctrl_frame = ttk.Frame(main)
-        self.ctrl_frame.pack(fill="x", pady=6)
-        self.run_btn = ttk.Button(self.ctrl_frame, text="Ejecutar", command=self.on_run)
-        self.run_btn.pack(side="left", padx=6)
-        self.stop_btn = ttk.Button(
-            self.ctrl_frame, text="Detener", command=self.on_stop, state="disabled"
-        )
-        self.stop_btn.pack(side="left")
-
-        self.console_frame = ttk.LabelFrame(main, text="Consola")
-        self.console_frame.pack(fill="both", expand=True, pady=6)
-
-        self.simple_log_widget = scrolledtext.ScrolledText(
-            self.console_frame, height=18, state="disabled", wrap="word"
-        )
-        self.simple_log_widget.pack(fill="both", expand=True)
-
-        self.adv_log_widget = scrolledtext.ScrolledText(
-            self.console_frame, height=18, state="disabled", wrap="word"
+        row_h = self._adv_panel_height - 2
+        x = 24
+        self._checkbox(adv_inner, "Omitir sábados y domingos", self.var_skip_weekends, x, row_h, COLOR_WHITE)
+        x += 230
+        self._checkbox(adv_inner, "Eliminar HTML temporales", self.var_remove_html, x, row_h, COLOR_WHITE)
+        x += 220
+        cb_console = self._checkbox(adv_inner, "Mostrar consola avanzada", self.var_show_adv_console,
+                                     x, row_h, COLOR_WHITE)
+        cb_console.configure(command=self.toggle_advanced_console)
+        x += 220
+        self._checkbox(
+            adv_inner, "Log detallado por día (feriados / datos faltantes)",
+            self.var_detail_log, x, row_h, COLOR_WHITE,
         )
 
-        today = datetime.now()
-        sdate = today - timedelta(days=30)
-        self.s_day.insert(0,   sdate.strftime("%d"))
-        self.s_month.insert(0, sdate.strftime("%m"))
-        self.s_year.insert(0,  sdate.strftime("%Y"))
-        self.e_day.insert(0,   today.strftime("%d"))
-        self.e_month.insert(0, today.strftime("%m"))
-        self.e_year.insert(0,  today.strftime("%Y"))
+        self._adv_panel_y = self._adv_toggle_y + 40
 
-        self.worker = None
+    def toggle_advanced(self) -> None:
+        self.adv_shown = not self.adv_shown
+        if self.adv_shown:
+            self.adv_toggle_btn.set_text("Opciones avanzadas ▾")
+            self.adv_panel.place(
+                x=MARGIN_X, y=self._adv_panel_y, width=APP_WIDTH - 2 * MARGIN_X,
+                height=self._adv_panel_height,
+            )
+        else:
+            self.adv_toggle_btn.set_text("Opciones avanzadas ▸")
+            self.adv_panel.place_forget()
+        self._reposition_log_area()
 
-    def _validate_digits_len(self, proposed, maxlen):
+    def _build_log_area(self) -> None:
+        self.log_label = tk.Label(
+            self.root, text="Registro de proceso", bg=COLOR_WHITE, fg=COLOR_BLACK,
+            font=self.fonts.section, anchor="w",
+        )
+        self.log_box = SuraLogBox(
+            self.root, fonts=self.fonts, width=APP_WIDTH - 2 * MARGIN_X, height=100,
+        )
+
+    def _reposition_log_area(self) -> None:
+        # El log siempre termina justo antes de la barra de progreso (posición
+        # fija); su punto de inicio depende de si el panel de opciones
+        # avanzadas está expandido o no, ya que todo el layout usa .place().
+        if self.adv_shown:
+            top_y = self._adv_panel_y + self._adv_panel_height + 14
+        else:
+            top_y = self._adv_toggle_y + 40
+
+        label_y = top_y
+        log_y = label_y + 26
+        height = max(60, LOG_BOTTOM_Y - log_y)
+
+        self.log_label.place(x=MARGIN_X, y=label_y, width=300, height=22)
+        self.log_box.reposition(MARGIN_X, log_y, height)
+
+    def _build_action_bar(self) -> None:
+        panel_width: int = APP_WIDTH - 2 * MARGIN_X
+
+        self.progress = SuraProgressBar(self.root, width=panel_width, height=9)
+        self.progress.place(x=MARGIN_X, y=PROGRESS_Y)
+
+        self.status = tk.Label(
+            self.root, text="Listo para iniciar.", bg=COLOR_WHITE, fg=COLOR_TEXT_MUTED,
+            font=self.fonts.status, anchor="w",
+        )
+        self.status.place(x=MARGIN_X, y=BUTTONS_Y + 7, width=560, height=22)
+
+        total_button_width = 150 + 116 + 116 + 10 + 10
+        start_x = APP_WIDTH - MARGIN_X - total_button_width
+
+        self.run_btn = SuraButton(
+            self.root, text="Ejecutar", command=self.on_run, variant="primary",
+            width=150, height=36, font=self.fonts.button,
+        )
+        self.run_btn.place(x=start_x, y=BUTTONS_Y)
+
+        self.stop_btn = SuraButton(
+            self.root, text="Detener", command=self.on_stop, variant="secondary",
+            width=116, height=36, font=self.fonts.button,
+        )
+        self.stop_btn.place(x=start_x + 160, y=BUTTONS_Y)
+        self.stop_btn.set_enabled(False)
+
+        self.close_btn = SuraButton(
+            self.root, text="Cerrar", command=self.on_close, variant="secondary",
+            width=116, height=36, font=self.fonts.button,
+        )
+        self.close_btn.place(x=start_x + 286, y=BUTTONS_Y)
+
+    # ------------------------------------------------------------- helpers
+
+    def _validate_digits_len(self, proposed: str, maxlen: str) -> bool:
         if proposed == "":
             return True
         if not proposed.isdigit():
             return False
         return len(proposed) <= int(maxlen)
 
-    def choose_folder(self):
-        d = filedialog.askdirectory(initialdir=self.out_var.get() or os.getcwd())
+    def _set_default_dates(self) -> None:
+        sdate, edate = bimestre_anterior(datetime.now().date())
+        self.s_day.set(f"{sdate.day:02d}")
+        self.s_month.set(f"{sdate.month:02d}")
+        self.s_year.set(f"{sdate.year:04d}")
+        self.e_day.set(f"{edate.day:02d}")
+        self.e_month.set(f"{edate.month:02d}")
+        self.e_year.set(f"{edate.year:04d}")
+
+    def _choose_folder(self) -> None:
+        d = filedialog.askdirectory(initialdir=self.folder_entry.get() or str(default_output_dir()))
         if d:
-            self.out_var.set(d)
+            self.folder_entry.set(d)
 
-    def toggle_advanced(self):
-        if self.adv_shown:
-            self.adv_frame.pack_forget()
-            self.adv_shown = False
-            self.adv_btn.config(text="Opciones avanzadas ▸")
-        else:
-            self.adv_frame.pack(fill="x", pady=4, before=self.ctrl_frame)
-            self.adv_shown = True
-            self.adv_btn.config(text="Opciones avanzadas ▾")
+    def toggle_advanced_console(self) -> None:
+        self._console_mode = "advanced" if self.var_show_adv_console.get() else "simple"
+        lines = self._log_advanced_lines if self._console_mode == "advanced" else self._log_simple_lines
+        self.log_box.set_content(lines)
 
-    def toggle_advanced_console(self):
-        show = self.var_show_adv_console.get()
-        if show:
-            self.simple_log_widget.pack_forget()
-            self.adv_log_widget.pack(fill="both", expand=True)
-            self.console_frame.config(text="Consola avanzada")
-            self.current_console = "advanced"
-        else:
-            self.adv_log_widget.pack_forget()
-            self.simple_log_widget.pack(fill="both", expand=True)
-            self.console_frame.config(text="Consola")
-            self.current_console = "simple"
+    def log_simple(self, msg: str) -> None:
+        self._log_simple_lines.append(msg)
+        self.status.configure(text=msg)
+        if self._console_mode == "simple":
+            self.log_box.write(msg)
 
-    def log_simple(self, msg: str):
-        self.simple_log_widget.config(state="normal")
-        self.simple_log_widget.insert("end", msg + "\n")
-        self.simple_log_widget.see("end")
-        self.simple_log_widget.config(state="disabled")
-
-    def log_advanced(self, msg: str):
+    def log_advanced(self, msg: str) -> None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.adv_log_widget.config(state="normal")
-        self.adv_log_widget.insert("end", f"[{ts}] {msg}\n")
-        self.adv_log_widget.see("end")
-        self.adv_log_widget.config(state="disabled")
+        line = f"[{ts}] {msg}"
+        self._log_advanced_lines.append(line)
+        if self._console_mode == "advanced":
+            self.log_box.write(line)
 
-    def on_run(self):
+    # ------------------------------------------------------------- acciones
+
+    def on_run(self) -> None:
         try:
-            s_day  = self.s_day.get().zfill(2)
-            s_mon  = self.s_month.get().zfill(2)
-            s_year = self.s_year.get().zfill(4)
-            e_day  = self.e_day.get().zfill(2)
-            e_mon  = self.e_month.get().zfill(2)
-            e_year = self.e_year.get().zfill(4)
+            s_day  = self.s_day.get().strip().zfill(2)
+            s_mon  = self.s_month.get().strip().zfill(2)
+            s_year = self.s_year.get().strip().zfill(4)
+            e_day  = self.e_day.get().strip().zfill(2)
+            e_mon  = self.e_month.get().strip().zfill(2)
+            e_year = self.e_year.get().strip().zfill(4)
             start  = f"{s_day}/{s_mon}/{s_year}"
             end    = f"{e_day}/{e_mon}/{e_year}"
             parse_ddmmyyyy(start)
@@ -1181,65 +2192,105 @@ class TasasApp(tk.Tk):
         except Exception:
             messagebox.showerror(
                 "Fecha inválida",
-                "Por favor completa las fechas con valores válidos y verifica "
+                "Completar las fechas con valores válidos y verificar "
                 "que la fecha fin no sea anterior a la fecha inicio.",
             )
             return
 
-        out_base_dir = self.out_var.get().strip() or os.getcwd()
-        self.run_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
+        out_base_dir = self.folder_entry.get().strip() or str(default_output_dir())
+        self.cancel_event.clear()
+        self._worker_status = None
+        self.run_btn.set_enabled(False)
+        self.stop_btn.set_enabled(True)
+        self.progress.set_progress(0.0)
         self.log_simple(f"Iniciando proceso desde {start} hasta {end}.")
         self.log_advanced(f"[INFO] Iniciando proceso desde {start} hasta {end}.")
 
+        generate_detail_log = self.var_detail_log.get()
+
         self.worker = threading.Thread(
-            target=self._worker, args=(start, end, out_base_dir), daemon=True
+            target=self._worker, args=(start, end, out_base_dir, generate_detail_log), daemon=True,
         )
         self.worker.start()
-        self.after(300, self._poll_worker)
+        self.root.after(300, self._poll_worker)
 
-    def _worker(self, start, end, out_base_dir):
+    def _worker(self, start: str, end: str, out_base_dir: str, generate_detail_log: bool) -> None:
+        status = "error_excepcion"
         try:
-            run_date_range(
+            status = run_date_range(
                 start, end,
-                out_base_dir      = out_base_dir,
-                log_fn            = lambda s: self.after(0, lambda: self.log_advanced(s)),
-                simple_log_fn     = lambda s: self.after(0, lambda: self.log_simple(s)),
-                import_natural    = self.var_nat.get(),
-                import_juridica   = self.var_jur.get(),
-                import_general    = self.var_gen.get(),
-                remove_html_after = self.var_remove_html.get(),
-                skip_weekends     = self.var_skip_weekends.get(),
+                out_base_dir        = out_base_dir,
+                log_fn               = lambda s: self.root.after(0, lambda: self.log_advanced(s)),
+                simple_log_fn        = lambda s: self.root.after(0, lambda: self.log_simple(s)),
+                import_natural       = self.var_nat.get(),
+                import_juridica      = self.var_jur.get(),
+                import_general       = self.var_gen.get(),
+                remove_html_after    = self.var_remove_html.get(),
+                skip_weekends        = self.var_skip_weekends.get(),
+                cancel_event         = self.cancel_event,
+                generate_detail_log  = generate_detail_log,
+                progress_fn          = lambda f: self.root.after(0, lambda: self.progress.set_progress(f)),
             )
         except Exception as e:
-            self.after(0, lambda: self.log_advanced(f"[ERROR] Excepción en worker: {e}"))
-            self.after(0, lambda: self.log_advanced(traceback.format_exc()))
-            self.after(0, lambda: self.log_simple("Se produjo un error. Revisa la consola avanzada."))
+            self.root.after(0, lambda: self.log_advanced(f"[ERROR] Excepción no controlada en el proceso: {e}"))
+            self.root.after(0, lambda: self.log_advanced(traceback.format_exc()))
+            self.root.after(0, lambda: self.log_simple("Se produjo un error inesperado. Revisar la consola avanzada."))
+        self._worker_status = status
 
-    def _poll_worker(self):
+    def _poll_worker(self) -> None:
         if self.worker and self.worker.is_alive():
-            self.after(500, self._poll_worker)
-        else:
-            self.run_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
-            self.log_simple("Proceso terminado.")
-            self.log_advanced("[INFO] Proceso terminado.")
+            self.root.after(500, self._poll_worker)
+            return
 
-    def on_stop(self):
-        self.log_simple("Detención solicitada por el usuario.")
-        self.log_advanced(
-            "[INFO] Solicitud de detener recibida. "
-            "Cierra Chrome manualmente si deseas detener más rápido."
-        )
-        self.run_btn.config(state="normal")
-        self.stop_btn.config(state="disabled")
+        self.run_btn.set_enabled(True)
+        self.stop_btn.set_enabled(False)
+
+        mensajes = {
+            "completado":       "Proceso terminado.",
+            "cancelado":        "Proceso detenido por el usuario.",
+            "error_chrome":     "Proceso finalizado con error: no se pudo iniciar Chrome.",
+            "error_navegacion": "Proceso finalizado con error: no se pudo cargar la página de la SBS.",
+            "error_excepcion":  "Proceso finalizado con un error inesperado. Revisar la consola avanzada.",
+        }
+        msg = mensajes.get(self._worker_status, "Proceso terminado.")
+        self.log_simple(msg)
+        self.log_advanced(f"[INFO] {msg}")
+
+    def on_stop(self) -> None:
+        # No reactivar "Ejecutar" aquí: el hilo (y Chrome) siguen vivos hasta
+        # que terminen la fecha en curso y salgan del bucle; _poll_worker se
+        # encarga de reactivar los botones recién cuando el hilo finalice.
+        self.cancel_event.set()
+        self.stop_btn.set_enabled(False)
+        self.log_simple("Deteniendo el proceso — esperando a que finalice la fecha en curso.")
+        self.log_advanced("[INFO] Solicitud de detener recibida por el usuario.")
+
+    def on_close(self) -> None:
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno(
+                "Proceso en curso", "Hay un proceso en ejecución. ¿Detener el proceso y salir?",
+            ):
+                return
+            self.cancel_event.set()
+            self.root.after(200, self._wait_and_destroy)
+        else:
+            self.root.destroy()
+
+    def _wait_and_destroy(self) -> None:
+        if self.worker and self.worker.is_alive():
+            self.root.after(200, self._wait_and_destroy)
+        else:
+            self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
 
 # ==================== ENTRYPOINT ====================
 
 
-def main():
+def main() -> None:
     app = TasasApp()
-    app.mainloop()
+    app.run()
 
 
 if __name__ == "__main__":

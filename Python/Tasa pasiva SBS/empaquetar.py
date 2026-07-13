@@ -18,6 +18,17 @@ src = root / PY_FILE
 if not src.exists():
     raise FileNotFoundError(f"No se encontró {PY_FILE} en {root}")
 
+assets_dir = root / "assets"
+tiene_assets = assets_dir.is_dir()
+if tiene_assets:
+    print(f"Carpeta assets encontrada: {assets_dir} (se incluirá en el .exe)")
+else:
+    print("Advertencia: no se encontró la carpeta 'assets'. El .exe se generará "
+          "sin banner/ícono corporativo (la interfaz seguirá funcionando).")
+
+icon_path = assets_dir / "icon.ico" if tiene_assets else None
+tiene_icon = icon_path is not None and icon_path.exists()
+
 # Crear carpeta temporal en %TEMP% (local, fuera de OneDrive)
 # para que PyInstaller no sufra bloqueos de sincronización
 tmp_root  = Path(tempfile.mkdtemp(prefix="tasas_build_"))
@@ -73,13 +84,11 @@ for pkg in packages:
 print("  Instalación completada.")
 
 # ==================== PASO 3: Preparar script fuente ====================
-# Si el script tiene el parche de webdriver-manager de versiones anteriores,
-# se revierte para usar el webdriver.Chrome() nativo de Selenium 4.x.
 print("\n[3/4] Preparando script fuente...")
 
 script_text = src.read_text(encoding="utf-8")
 
-# Revertir parche de webdriver-manager si existe
+# Revertir parche de webdriver-manager de versiones anteriores, si existe
 if "webdriver_manager" in script_text:
     print("  Revirtiendo parche de webdriver-manager (no necesario en Selenium 4.x)...")
     script_text = script_text.replace(
@@ -138,6 +147,7 @@ hidden_imports = [
     "tkinter.messagebox",
     "tkinter.filedialog",
     "tkinter.scrolledtext",
+    "tkinter.font",
 ]
 
 pyinstaller_exe = (
@@ -145,6 +155,9 @@ pyinstaller_exe = (
     if os.name == "nt"
     else venv_dir / "bin" / "pyinstaller"
 )
+
+# Separador de --add-data: ";" en Windows, ":" en Linux/Mac
+add_data_sep = ";" if os.name == "nt" else ":"
 
 cmd = [
     str(pyinstaller_exe),
@@ -156,6 +169,14 @@ cmd = [
     "--workpath",  str(tmp_build),
     "--specpath",  str(tmp_root),
 ]
+
+if tiene_assets:
+    # Empaqueta la carpeta assets dentro del .exe. En tiempo de ejecución,
+    # script.py la ubica vía sys._MEIPASS (ver resource_base() en script.py).
+    cmd += ["--add-data", f"{assets_dir}{add_data_sep}assets"]
+
+if tiene_icon:
+    cmd += ["--icon", str(icon_path)]
 
 for hi in hidden_imports:
     cmd += ["--hidden-import", hi]
@@ -199,6 +220,6 @@ shutil.rmtree(tmp_root, ignore_errors=True)
 print("  Carpeta temporal eliminada.")
 
 print("\n" + "=" * 60)
-print(f"  LISTO. Ejecuta {exe_name} directamente.")
+print(f"  LISTO. Ejecutar {exe_name} directamente.")
 print(f"  Requiere Chrome instalado en el equipo.")
 print("=" * 60)
